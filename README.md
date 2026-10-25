@@ -27,7 +27,7 @@ Be honest with yourself about the speed. On this 1B model the NPU is slower than
 
 ## 0. Hardware and software baseline
 
-- Lenovo Yoga Slim 7x 14Q8X9 (83ED), X1E80100, 32 GB RAM
+- Lenovo Yoga Slim 7x (machine type 83ED), X1E80100, 32 GB RAM (30 GB visible)
 - Kernel 7.2.9 (stable) with our "lean" config: `CONFIG_QCOM_FASTRPC=m`, `CONFIG_DMA_CMA=y`, `CONFIG_DMABUF_HEAPS_SYSTEM/CMA=y`
 - Kernel command line used: `clk_ignore_unused pd_ignore_unused cma=128M efi=noruntime`
 - Mesa 26.0.8, linux-firmware 20260319, Ubuntu-based userland
