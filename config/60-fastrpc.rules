@@ -1,0 +1,6 @@
+# Let members of group "fastrpc" open the CDSP/ADSP FastRPC nodes (unsigned PD use).
+# The -secure nodes stay root-only on purpose.
+# Install: sudo groupadd -f fastrpc; sudo usermod -aG fastrpc $USER
+#          sudo cp 60-fastrpc.rules /etc/udev/rules.d/; sudo udevadm control --reload; sudo udevadm trigger -s misc
+KERNEL=="fastrpc-cdsp", SUBSYSTEM=="misc", GROUP="fastrpc", MODE="0660"
+KERNEL=="fastrpc-adsp", SUBSYSTEM=="misc", GROUP="fastrpc", MODE="0660"

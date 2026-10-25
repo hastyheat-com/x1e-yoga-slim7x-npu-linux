@@ -1,0 +1,81 @@
+From: Shawn Guo <shengchao.guo@oss.qualcomm.com>
+Date: Tue, 28 Jul 2026 15:38:51 +0800
+Subject: [PATCH v2] misc: fastrpc: Drop unhandled DSP PD exit notification
+Message-ID: <20260728073851.682023-1-shengchao.guo@oss.qualcomm.com>
+Link: https://lore.kernel.org/all/20260728073851.682023-1-shengchao.guo@oss.qualcomm.com/
+
+Newer DSP firmware implements a PD (Protection Domain) notification
+framework that sends PD state notifications upon request. The PD exit
+notification is unconditionally sent by the DSP with a fixed sentinel
+0xABCDABCD in the context field.
+
+fastrpc_rpmsg_callback() treats every inbound message as an invoke
+response, so the sentinel is masked and shifted like any real response
+((0xABCDABCD & 0xFF0) >> 4 == 188) and looked up in the channel's
+context idr.
+
+This is not merely cosmetic. In the common case idr slot 188 is empty,
+the lookup fails, and the driver only logs a spurious "No context ID
+matches response" error on every teardown. But the context idr is shared
+by every protection domain and the listener thread on the channel and is
+filled cyclically over [1, FASTRPC_CTX_MAX]. If slot 188 holds a live
+context when the sentinel arrives, the sentinel's return value is written
+into that unrelated in-flight invocation and it is completed early.
+
+Since neither the fastrpc library nor the driver supports the DSP PD
+notification framework, it is safe to drop the PD exit notification
+before it is ever turned into a context lookup. This removes both the
+log spam and the mis-completion race. A genuine response can never be
+masked: a real context is (idr_index << 4) | pd (at most 0xFF3) and
+can never equal the sentinel.
+
+Assisted-by: Claude:claude-opus-4-8
+Reviewed-by: Ekansh Gupta <ekansh.gupta@oss.qualcomm.com>
+Signed-off-by: Shawn Guo <shengchao.guo@oss.qualcomm.com>
+---
+Changes for v2:
+- Update per Ekansh's input about PD state notification (Thanks Ekansh!)
+- Link to v1: https://lore.kernel.org/all/20260727130940.577721-1-shengchao.guo@oss.qualcomm.com/
+
+ drivers/misc/fastrpc.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/drivers/misc/fastrpc.c b/drivers/misc/fastrpc.c
+index d86e79134c68..97c60271f94a 100644
+--- a/drivers/misc/fastrpc.c
++++ b/drivers/misc/fastrpc.c
+@@ -38,6 +38,17 @@
+ #define FASTRPC_INIT_HANDLE	1
+ #define FASTRPC_DSP_UTILITIES_HANDLE	2
+ #define FASTRPC_CTXID_MASK (0xFF0)
++
++/*
++ * Newer DSP firmware implements a PD (Protection Domain) notification
++ * framework that sends PD state notifications upon request. The PD exit
++ * notification is unconditionally sent by the DSP with this fixed sentinel
++ * in the context field rather than the context of an outstanding invocation.
++ * Since the fastrpc driver does not support the DSP PD notification framework,
++ * this message must be dropped rather than matched against the context idr.
++ */
++#define FASTRPC_DSP_PD_NOTIFY_CTX	0xABCDABCD
++
+ #define INIT_FILELEN_MAX (2 * 1024 * 1024)
+ #define INIT_FILE_NAMELEN_MAX (128)
+ #define FASTRPC_DEVICE_NAME	"fastrpc"
+@@ -2552,6 +2563,14 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
+ 	if (!cctx)
+ 		return -ENODEV;
+ 
++	/*
++	 * A PD exit notification from the DSP PD notification framework carries
++	 * this sentinel rather than a real context. Drop it: a real context is
++	 * (idr_index << 4) | pd and can never collide with this value.
++	 */
++	if (rsp->ctx == FASTRPC_DSP_PD_NOTIFY_CTX)
++		return 0;
++
+ 	ctxid = ((rsp->ctx & FASTRPC_CTXID_MASK) >> 4);
+ 
+ 	spin_lock_irqsave(&cctx->lock, flags);
+-- 
+2.43.0

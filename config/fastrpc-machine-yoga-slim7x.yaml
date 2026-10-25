@@ -1,0 +1,7 @@
+# Machine config read by a libcdsprpc built with --with-config-base-dir=/opt/hexagon/qcom/
+# Place in /opt/hexagon/qcom/conf.d/. DSP_LIBRARY_PATH is relative to the config base dir and
+# must point at the cDSP userland you extracted YOURSELF from your own Windows install (see README).
+machines:
+  Lenovo Yoga Slim 7x:
+    DSP_LIBRARY_PATH: x1e80100/lenovo-83ED-win-c1-00075/cdsp
+    CDSP_ARCH: v73

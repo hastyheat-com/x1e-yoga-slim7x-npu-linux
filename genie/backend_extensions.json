@@ -1,0 +1,38 @@
+{
+  "context": [
+    {
+      "weight_sharing_enabled": true
+    }
+  ],
+  "graphs": [
+    {
+      "O": 3,
+      "graph_names": [
+        "SHA_16_ar1"
+      ]
+    },
+    {
+      "O": 3,
+      "graph_names": [
+        "SHA_16_ar64"
+      ]
+    }
+  ],
+  "devices": [
+    {
+      "device_id": 0,
+      "soc_model": 60,
+      "dsp_arch": "v73",
+      "cores": [
+        {
+          "core_id": 0,
+          "perf_profile": "burst",
+          "rpc_control_latency": 100
+        }
+      ]
+    }
+  ],
+  "memory": {
+    "mem_type": "shared_buffer"
+  }
+}

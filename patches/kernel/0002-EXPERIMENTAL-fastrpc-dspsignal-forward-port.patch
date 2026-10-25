@@ -1,0 +1,359 @@
+Subject: [EXPERIMENTAL] misc: fastrpc: forward-port DSP signal (dspsignal) support to 7.2.9
+
+Forward-port of the unmerged 2024 series patch
+"[PATCH v1 14/16] misc: fastrpc: Add DSP signal support"
+(Ekansh Gupta, Anandu Krishnan E; Qualcomm), patchwork id 13542157,
+Message-ID <20240202064039.15505-15-quic_ekangupt@quicinc.com>.
+
+Differences from the 2024 patch (mainline has no multimode-invoke ioctl,
+so this cannot be a straight cherry-pick):
+ - exposed through a dedicated ioctl FASTRPC_IOCTL_DSPSIGNAL
+   _IOWR('R', 0x40, struct fastrpc_ioctl_dspsignal) - a PRIVATE number,
+   not upstream ABI; needs the matching libcdsprpc patch in
+   patches/fastrpc-userspace/
+ - req 0 (QUERY) lets userspace probe for support
+ - DSP <-> CPU signal message uses fl->client_id (what mainline sends to
+   the DSP as the process id) instead of tgid
+ - 8-byte signal messages are handled before the "len < sizeof(rsp)"
+   check in the rpmsg callback (mainline would otherwise drop them)
+ - receiver looks the user up under cctx->lock and does not dereference
+   a missing user (the 2024 code did when no user matched)
+ - wait timeout compares the microsecond value, not jiffies, against
+   the "no timeout" sentinel
+ - signal groups are freed in fastrpc_user_free()
+
+Applies on top of 0001 (PD-exit v2). Build-tested on 7.2.9 (arm64).
+NOT yet boot-tested at the time of publishing.
+Note: qualcomm/fastrpc#377 reports that a dspsignal backport alone did
+not cure the hang on X2 Elite (glymur); X1E results are pending.
+---
+--- a/drivers/misc/fastrpc.c	2026-10-25 10:04:45.819935988 -0500
++++ b/drivers/misc/fastrpc.c	2026-10-25 12:44:08.233535311 -0500
+@@ -49,6 +49,28 @@
+  */
+ #define FASTRPC_DSP_PD_NOTIFY_CTX	0xABCDABCD
+ 
++/*
++ * DSP signal (dspsignal) support, forward-ported from the unmerged 2024
++ * series "[PATCH v1 14/16] misc: fastrpc: Add DSP signal support"
++ * (Ekansh Gupta / Anandu Krishnan E, Qualcomm). EXPERIMENTAL.
++ */
++#define FASTRPC_DSPSIGNAL_TIMEOUT_NONE	0xffffffff
++#define FASTRPC_DSPSIGNAL_NUM_SIGNALS	1024
++#define FASTRPC_DSPSIGNAL_GROUP_SIZE	256
++#define FASTRPC_DSPSIGNAL_NUM_GROUPS	(FASTRPC_DSPSIGNAL_NUM_SIGNALS / FASTRPC_DSPSIGNAL_GROUP_SIZE)
++
++enum fastrpc_dspsignal_state {
++	DSPSIGNAL_STATE_UNUSED = 0,
++	DSPSIGNAL_STATE_PENDING,
++	DSPSIGNAL_STATE_SIGNALED,
++	DSPSIGNAL_STATE_CANCELED,
++};
++
++struct fastrpc_dspsignal {
++	struct completion comp;
++	int state;
++};
++
+ #define INIT_FILELEN_MAX (2 * 1024 * 1024)
+ #define INIT_FILE_NAMELEN_MAX (128)
+ #define FASTRPC_DEVICE_NAME	"fastrpc"
+@@ -323,6 +345,10 @@
+ 	struct mutex mutex;
+ 	/* Reference count */
+ 	struct kref refcount;
++	/* lock for dsp signals */
++	spinlock_t dspsignals_lock;
++	struct mutex signal_create_mutex;
++	struct fastrpc_dspsignal *signal_groups[FASTRPC_DSPSIGNAL_NUM_GROUPS];
+ };
+ 
+ /* Extract SMMU PA from consolidated IOVA */
+@@ -525,6 +551,7 @@
+ 	struct fastrpc_invoke_ctx *ctx, *n;
+ 	struct fastrpc_map *map, *m;
+ 	struct fastrpc_buf *buf, *b;
++	int i;
+ 
+ 	if (fl->init_mem)
+ 		fastrpc_buf_free(fl->init_mem);
+@@ -543,6 +570,9 @@
+ 	}
+ 
+ 	fastrpc_channel_ctx_put(fl->cctx);
++	for (i = 0; i < FASTRPC_DSPSIGNAL_NUM_GROUPS; i++)
++		kfree(fl->signal_groups[i]);
++	mutex_destroy(&fl->signal_create_mutex);
+ 	mutex_destroy(&fl->mutex);
+ 	kfree(fl);
+ }
+@@ -1675,6 +1705,8 @@
+ 	filp->private_data = fl;
+ 	spin_lock_init(&fl->lock);
+ 	mutex_init(&fl->mutex);
++	spin_lock_init(&fl->dspsignals_lock);
++	mutex_init(&fl->signal_create_mutex);
+ 	INIT_LIST_HEAD(&fl->pending);
+ 	INIT_LIST_HEAD(&fl->maps);
+ 	INIT_LIST_HEAD(&fl->mmaps);
+@@ -2176,6 +2208,196 @@
+ 	return err;
+ }
+ 
++static struct fastrpc_dspsignal *fastrpc_dspsignal_get(struct fastrpc_user *fl, u32 signal_id)
++{
++	struct fastrpc_dspsignal *group = fl->signal_groups[signal_id / FASTRPC_DSPSIGNAL_GROUP_SIZE];
++
++	return group ? &group[signal_id % FASTRPC_DSPSIGNAL_GROUP_SIZE] : NULL;
++}
++
++static int fastrpc_dspsignal_signal(struct fastrpc_user *fl, u32 signal_id)
++{
++	struct fastrpc_channel_ctx *cctx = fl->cctx;
++	u64 msg;
++
++	if (!cctx->rpdev)
++		return -EPIPE;
++	/* The DSP knows this process by the client_id sent at PD creation */
++	msg = ((u64)(u32)fl->client_id << 32) | signal_id;
++	return rpmsg_send(cctx->rpdev->ept, &msg, sizeof(msg));
++}
++
++static int fastrpc_dspsignal_wait(struct fastrpc_user *fl, u32 signal_id, u32 timeout_usec)
++{
++	struct fastrpc_dspsignal *s;
++	unsigned long irq_flags;
++	long ret;
++	int err = 0;
++
++	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
++	s = fastrpc_dspsignal_get(fl, signal_id);
++	if (!s || s->state == DSPSIGNAL_STATE_UNUSED) {
++		spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
++		return -ENOENT;
++	}
++	if (s->state != DSPSIGNAL_STATE_PENDING) {
++		if (s->state == DSPSIGNAL_STATE_CANCELED)
++			err = -EINTR;
++		else /* SIGNALED: consume it */
++			s->state = DSPSIGNAL_STATE_PENDING;
++		if (!err)
++			reinit_completion(&s->comp);
++		spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
++		return err;
++	}
++	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
++
++	if (timeout_usec != FASTRPC_DSPSIGNAL_TIMEOUT_NONE)
++		ret = wait_for_completion_interruptible_timeout(&s->comp,
++				usecs_to_jiffies(timeout_usec));
++	else
++		ret = wait_for_completion_interruptible(&s->comp);
++
++	if (ret == 0)
++		return -ETIMEDOUT;
++	if (ret < 0)
++		return ret;
++
++	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
++	if (s->state == DSPSIGNAL_STATE_SIGNALED) {
++		s->state = DSPSIGNAL_STATE_PENDING;
++		reinit_completion(&s->comp);
++	} else if (s->state == DSPSIGNAL_STATE_CANCELED ||
++		   s->state == DSPSIGNAL_STATE_UNUSED) {
++		err = -EINTR;
++	}
++	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
++
++	return err;
++}
++
++static int fastrpc_dspsignal_create(struct fastrpc_user *fl, u32 signal_id)
++{
++	struct fastrpc_dspsignal *group, *sig;
++	unsigned long irq_flags;
++	int i, gi = signal_id / FASTRPC_DSPSIGNAL_GROUP_SIZE;
++
++	mutex_lock(&fl->signal_create_mutex);
++	if (!fl->signal_groups[gi]) {
++		group = kcalloc(FASTRPC_DSPSIGNAL_GROUP_SIZE, sizeof(*group), GFP_KERNEL);
++		if (!group) {
++			mutex_unlock(&fl->signal_create_mutex);
++			return -ENOMEM;
++		}
++		for (i = 0; i < FASTRPC_DSPSIGNAL_GROUP_SIZE; i++) {
++			init_completion(&group[i].comp);
++			group[i].state = DSPSIGNAL_STATE_UNUSED;
++		}
++		spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
++		fl->signal_groups[gi] = group;
++		spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
++	}
++
++	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
++	sig = fastrpc_dspsignal_get(fl, signal_id);
++	if (sig->state != DSPSIGNAL_STATE_UNUSED) {
++		spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
++		mutex_unlock(&fl->signal_create_mutex);
++		return -EBUSY;
++	}
++	sig->state = DSPSIGNAL_STATE_PENDING;
++	reinit_completion(&sig->comp);
++	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
++	mutex_unlock(&fl->signal_create_mutex);
++
++	return 0;
++}
++
++static int fastrpc_dspsignal_end(struct fastrpc_user *fl, u32 signal_id, int new_state)
++{
++	struct fastrpc_dspsignal *s;
++	unsigned long irq_flags;
++
++	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
++	s = fastrpc_dspsignal_get(fl, signal_id);
++	if (!s || s->state == DSPSIGNAL_STATE_UNUSED) {
++		spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
++		return -ENOENT;
++	}
++	if (s->state != new_state) {
++		s->state = new_state;
++		complete_all(&s->comp);
++	}
++	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
++
++	return 0;
++}
++
++static int fastrpc_invoke_dspsignal(struct fastrpc_user *fl, char __user *argp)
++{
++	struct fastrpc_ioctl_dspsignal sig;
++
++	if (copy_from_user(&sig, argp, sizeof(sig)))
++		return -EFAULT;
++	if (sig.req == FASTRPC_DSPSIGNAL_QUERY)
++		return 0;
++	if (sig.signal_id >= FASTRPC_DSPSIGNAL_NUM_SIGNALS)
++		return -EINVAL;
++
++	switch (sig.req) {
++	case FASTRPC_DSPSIGNAL_SIGNAL:
++		return fastrpc_dspsignal_signal(fl, sig.signal_id);
++	case FASTRPC_DSPSIGNAL_WAIT:
++		return fastrpc_dspsignal_wait(fl, sig.signal_id, sig.timeout_usec);
++	case FASTRPC_DSPSIGNAL_CREATE:
++		if (sig.timeout_usec) /* flags must be 0 */
++			return -EINVAL;
++		return fastrpc_dspsignal_create(fl, sig.signal_id);
++	case FASTRPC_DSPSIGNAL_DESTROY:
++		return fastrpc_dspsignal_end(fl, sig.signal_id, DSPSIGNAL_STATE_UNUSED);
++	case FASTRPC_DSPSIGNAL_CANCEL_WAIT:
++		return fastrpc_dspsignal_end(fl, sig.signal_id, DSPSIGNAL_STATE_CANCELED);
++	}
++	return -EINVAL;
++}
++
++/* Called from the rpmsg callback (atomic context) */
++static void fastrpc_handle_signal_rpmsg(u64 msg, struct fastrpc_channel_ctx *cctx)
++{
++	u32 client_id = msg >> 32;
++	u32 signal_id = msg & 0xffffffff;
++	struct fastrpc_dspsignal *sig;
++	struct fastrpc_user *fl;
++	unsigned long flags, irq_flags;
++	bool found = false;
++
++	if (signal_id >= FASTRPC_DSPSIGNAL_NUM_SIGNALS)
++		return;
++
++	spin_lock_irqsave(&cctx->lock, flags);
++	list_for_each_entry(fl, &cctx->users, user) {
++		if ((u32)fl->client_id != client_id)
++			continue;
++		found = true;
++		spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
++		sig = fastrpc_dspsignal_get(fl, signal_id);
++		if (sig && (sig->state == DSPSIGNAL_STATE_PENDING ||
++			    sig->state == DSPSIGNAL_STATE_SIGNALED)) {
++			sig->state = DSPSIGNAL_STATE_SIGNALED;
++			complete(&sig->comp);
++		} else {
++			dev_dbg(&cctx->rpdev->dev, "unknown signal %u for client %u\n",
++				signal_id, client_id);
++		}
++		spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
++		break;
++	}
++	spin_unlock_irqrestore(&cctx->lock, flags);
++	if (!found)
++		dev_dbg(&cctx->rpdev->dev, "signal %u for unknown client %u\n",
++			signal_id, client_id);
++}
++
+ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
+ 				 unsigned long arg)
+ {
+@@ -2217,6 +2439,9 @@
+ 	case FASTRPC_IOCTL_GET_DSP_INFO:
+ 		err = fastrpc_get_dsp_info(fl, argp);
+ 		break;
++	case FASTRPC_IOCTL_DSPSIGNAL:
++		err = fastrpc_invoke_dspsignal(fl, argp);
++		break;
+ 	default:
+ 		err = -ENOTTY;
+ 		break;
+@@ -2552,12 +2777,18 @@
+ 	unsigned long flags;
+ 	unsigned long ctxid;
+ 
+-	if (len < sizeof(*rsp))
+-		return -EINVAL;
+-
+ 	if (!cctx)
+ 		return -ENODEV;
+ 
++	/* An 8-byte message is a DSP signal: (client_id << 32) | signal_id */
++	if (len == sizeof(u64)) {
++		fastrpc_handle_signal_rpmsg(*(u64 *)data, cctx);
++		return 0;
++	}
++
++	if (len < sizeof(*rsp))
++		return -EINVAL;
++
+ 	/*
+ 	 * A PD exit notification from the DSP PD notification framework carries
+ 	 * this sentinel rather than a real context. Drop it: a real context is
+--- a/include/uapi/misc/fastrpc.h	2026-10-03 05:43:16.000000000 -0500
++++ b/include/uapi/misc/fastrpc.h	2026-10-25 12:44:08.233464946 -0500
+@@ -17,6 +17,8 @@
+ #define FASTRPC_IOCTL_MEM_MAP		_IOWR('R', 10, struct fastrpc_mem_map)
+ #define FASTRPC_IOCTL_MEM_UNMAP		_IOWR('R', 11, struct fastrpc_mem_unmap)
+ #define FASTRPC_IOCTL_GET_DSP_INFO	_IOWR('R', 13, struct fastrpc_ioctl_capability)
++/* EXPERIMENTAL, not upstream: private ioctl number for the dspsignal forward-port */
++#define FASTRPC_IOCTL_DSPSIGNAL		_IOWR('R', 0x40, struct fastrpc_ioctl_dspsignal)
+ 
+ /**
+  * enum fastrpc_map_flags - control flags for mapping memory on DSP user process
+@@ -140,4 +142,20 @@
+ 	__u32 reserved[4];
+ };
+ 
++enum fastrpc_dspsignal_req {
++	FASTRPC_DSPSIGNAL_QUERY = 0,	/* returns 0 if supported */
++	FASTRPC_DSPSIGNAL_SIGNAL = 1,
++	FASTRPC_DSPSIGNAL_WAIT = 2,
++	FASTRPC_DSPSIGNAL_CREATE = 3,
++	FASTRPC_DSPSIGNAL_DESTROY = 4,
++	FASTRPC_DSPSIGNAL_CANCEL_WAIT = 5,
++};
++
++struct fastrpc_ioctl_dspsignal {
++	__u32 req;		/* enum fastrpc_dspsignal_req */
++	__u32 signal_id;
++	__u32 timeout_usec;	/* WAIT: 0xffffffff = no timeout; CREATE: flags */
++	__u32 reserved;
++};
++
+ #endif /* __QCOM_FASTRPC_H__ */

@@ -1,0 +1,72 @@
+Subject: [EXPERIMENTAL] libcdsprpc: wire dspsignal to the experimental kernel ioctl
+
+Applies to github.com/qualcomm/fastrpc at d247519 ("Add IDL files (#356)").
+Upstream libcdsprpc stubs ioctl_signal_* with AEE_EUNSUPPORTED and reports
+DSPSIGNAL_DRIVER_SUPPORT = 0, so dspqueue never uses driver signaling even
+if the kernel had it. This patch routes them to FASTRPC_IOCTL_DSPSIGNAL
+(_IOWR('R', 0x40, ...)) from patches/kernel/0002 and probes support with
+req=0. Install to a separate prefix so the stock library stays untouched.
+---
+diff --git a/src/fastrpc_ioctl.c b/src/fastrpc_ioctl.c
+index 22d7418..7873414 100644
+--- a/src/fastrpc_ioctl.c
++++ b/src/fastrpc_ioctl.c
+@@ -137,10 +137,29 @@ int ioctl_getinfo(int dev, uint32_t *info) {
+   return AEE_SUCCESS;
+ }
+ 
++
++/* EXPERIMENTAL: matches the out-of-tree kernel dspsignal forward-port
++ * (FASTRPC_IOCTL_DSPSIGNAL = _IOWR('R', 0x40, ...)). Not upstream. */
++struct fastrpc_ioctl_dspsignal_exp {
++  __u32 req;
++  __u32 signal_id;
++  __u32 timeout_usec;
++  __u32 reserved;
++};
++#define FASTRPC_IOCTL_DSPSIGNAL_EXP _IOWR('R', 0x40, struct fastrpc_ioctl_dspsignal_exp)
++static int dspsig_ioctl(int dev, uint32_t req, uint32_t id, uint32_t arg) {
++  struct fastrpc_ioctl_dspsignal_exp s = {req, id, arg, 0};
++  return ioctl(dev, FASTRPC_IOCTL_DSPSIGNAL_EXP, &s);
++}
++
+ int ioctl_getdspinfo(int dev, int domain, uint32_t attr, uint32_t *capability) {
+   int ioErr = AEE_SUCCESS;
+   static struct fastrpc_ioctl_capability cap = {0};
+ 
++  if (attr == DSPSIGNAL_DRIVER_SUPPORT) {
++    *capability = (dspsig_ioctl(dev, 0, 0, 0) == 0) ? 1 : 0;
++    return 0;
++  }
+   if (attr >= PERF_V2_DRIVER_SUPPORT && attr < FASTRPC_MAX_ATTRIBUTES) {
+     *capability = 0;
+     return 0;
+@@ -179,23 +198,23 @@ int ioctl_getperf(int dev, int key, void *data, int *datalen) {
+ }
+ 
+ int ioctl_signal_create(int dev, uint32_t signal, uint32_t flags) {
+-  return AEE_EUNSUPPORTED;
++  return dspsig_ioctl(dev, 3, signal, flags);
+ }
+ 
+ int ioctl_signal_destroy(int dev, uint32_t signal) {
+-  return AEE_EUNSUPPORTED;
++  return dspsig_ioctl(dev, 4, signal, 0);
+ }
+ 
+ int ioctl_signal_signal(int dev, uint32_t signal) {
+-  return AEE_EUNSUPPORTED;
++  return dspsig_ioctl(dev, 1, signal, 0);
+ }
+ 
+ int ioctl_signal_wait(int dev, uint32_t signal, uint32_t timeout_usec) {
+-  return AEE_EUNSUPPORTED;
++  return dspsig_ioctl(dev, 2, signal, timeout_usec);
+ }
+ 
+ int ioctl_signal_cancel_wait(int dev, uint32_t signal) {
+-  return AEE_EUNSUPPORTED;
++  return dspsig_ioctl(dev, 5, signal, 0);
+ }
+ 
+ int ioctl_sharedbuf(int dev,
